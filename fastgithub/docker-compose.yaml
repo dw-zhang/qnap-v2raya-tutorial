@@ -1,0 +1,70 @@
+# ==============================================================================
+#  FastGithub on QNAP Container Station —— 只给 GitHub 加速的本地 HTTPS 代理
+#
+#  上游：https://github.com/creazyboyone/FastGithub
+#  镜像：slcnx/fastgithub（FastGithub 2.0.4 / .NET 5）
+#
+#  ★ 三条源码级事实，决定这份配置为什么这么写：
+#    1) 程序用 Kestrel ListenLocalhost(38457) 硬编码只绑 127.0.0.1
+#       → 必须 network_mode: host。写 ports: 端口映射完全无效。
+#    2) Linux/容器环境只开 38457 一个监听口（80/443/22/9418 是 Windows 专属）。
+#    3) 没有"绑定地址"配置项 → 想让局域网访问只能靠 socat 转发（见文件末尾）。
+#
+#  部署：
+#    mkdir -p /share/Container/fastgithub/{cacert,logs}
+#    cd /share/Container/fastgithub && docker compose up -d
+#  验证：
+#    netstat -tln | grep 38457
+#    curl -x http://127.0.0.1:38457 -I https://github.com
+# ==============================================================================
+
+services:
+  fastgithub:
+    image: slcnx/fastgithub:latest
+    container_name: fastgithub
+
+    # ★ 必须 host 网络：容器内只监听 127.0.0.1:38457，host 模式下这个回环
+    #   才是 NAS 本机的回环，NAS 上的 git / curl 才连得上
+    network_mode: host
+
+    restart: unless-stopped
+
+    environment:
+      - TZ=Asia/Shanghai
+
+    volumes:
+      # ★ 关键：cacert 目录必须挂出来，而且**初始必须是空目录**。
+      #   镜像里预置了一对 2021 年的 CA 证书 + 私钥，这对密钥全世界都能从
+      #   公开镜像里拿到，属于"已泄露的 CA"。挂空目录把它遮住 → 首次启动
+      #   会现场生成一对全新的，只有这对新证书才值得信任。
+      - /share/Container/fastgithub/cacert:/fastgithub/cacert
+
+      - /share/Container/fastgithub/logs:/fastgithub/logs
+
+      # 想改端口：先在宿主机建好 appsettings.json（内容见 README），再挂载。
+      # ⚠️ 宿主机上这个文件必须先存在，否则 Docker 会建一个同名「目录」挂进去，
+      #    程序读配置直接失败，报错还很不直观。
+      # - /share/Container/fastgithub/appsettings.json:/fastgithub/appsettings.json:ro
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # ----------------------------------------------------------------------------
+  #  可选：让局域网设备也能用这个加速代理
+  #    ✅ NAS 自己：http://127.0.0.1:38457
+  #    ❌ 局域网设备：http://NAS-IP:38457 → 连不上（只绑回环）
+  #  需要就放开下面这段（会把 38458 转发到 127.0.0.1:38457）。
+  #  ⚠️ 等于在局域网开了一个 HTTP 代理：FastGithub 对配置内域名加速，
+  #     其它域名做穿透转发 —— 它并不是"只加速 GitHub"的白名单代理。
+  # ----------------------------------------------------------------------------
+  # fastgithub-lan:
+  #   image: alpine/socat
+  #   container_name: fastgithub-lan
+  #   network_mode: host
+  #   restart: unless-stopped
+  #   command:
+  #     - "TCP-LISTEN:38458,fork,reuseaddr"
+  #     - "TCP:127.0.0.1:38457"

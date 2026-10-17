@@ -1,0 +1,32 @@
+# ---- 绝不能提交的东西 ----
+# v2rayA 数据库：含 JWT 密钥、账号 hash、订阅与节点凭据
+v2raya.db
+v2raya.db-wal
+v2raya.db-shm
+config/
+config.json
+*.db
+*.db-wal
+*.db-shm
+
+# 订阅与节点
+subscription*.txt
+subscribe*.txt
+nodes*.txt
+*.url
+
+# FastGithub 生成的证书（只属于本机）
+fastgithub/cacert/
+cacert/
+*.cer
+*.key
+*.pem
+
+# 日志
+logs/
+*.log
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+*.swp

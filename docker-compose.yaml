@@ -1,0 +1,138 @@
+# ==============================================================================
+#  v2rayA on QNAP — 家用 NAS 科学上网（透明代理 + 分流 + 局域网共享）
+#
+#  适配：QTS 5.x / Container Station（docker 27.x / compose v2.29）
+#  镜像：mzz2017/v2raya:v2.5.10（内置 v2raya_core 2.5.10，基于 xray-core）
+#
+#  部署：
+#    mkdir -p /share/Container/v2raya/{config,logs}
+#    cd /share/Container/v2raya && docker compose up -d
+#    面板：http://<NAS-IP>:2017  （首次打开创建管理员账号）
+#
+#  三条硬性要求（缺一不可）：
+#    1) network_mode: host —— 透明代理必须直接操作主机网络栈
+#    2) privileged: true   —— 要写 iptables、读 /dev/net/tun
+#    3) 挂载 /etc/v2raya    —— 账号/节点/规则全在这里，不挂载重启即丢
+# ==============================================================================
+
+services:
+  v2raya:
+    image: mzz2017/v2raya:v2.5.10
+    container_name: v2raya
+    restart: unless-stopped
+
+    network_mode: host
+    privileged: true
+
+    command:
+      # QNAP 内核没有 nf_tables 子系统，必须走 xtables legacy 路径
+      - "--nftables-support=off"
+      # 家用宽带通常没有可用公网 IPv6，关掉可减少无谓的规则报错
+      - "--ipv6-support=off"
+
+    # 显式指定 DNS：绕开宿主机上 Tailscale 的 MagicDNS(100.100.100.100)，
+    # 否则解析订阅域名 / 节点域名经常超时
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+
+    environment:
+      TZ: Asia/Shanghai
+
+      # ★ 最关键的一行：镜像里的 /usr/local/bin/iptables 是包装脚本，
+      #   靠这个变量选后端：
+      #     未设置   -> iptables(=xtables-nft-multi) → QNAP 上必失败
+      #     nftables -> iptables-nft                 → QNAP 上必失败
+      #     legacy   -> iptables-legacy              → QNAP 上唯一可用
+      IPTABLES_MODE: legacy
+
+      V2RAYA_LOG_LEVEL: info
+
+    volumes:
+      - /share/Container/v2raya/config:/etc/v2raya
+      - /share/Container/v2raya/logs:/var/log/v2raya
+      - /lib/modules:/lib/modules:ro
+      - /etc/localtime:/etc/localtime:ro
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2017/"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ----------------------------------------------------------------------------
+  #  局域网网桥（socat）
+  #
+  #  为什么需要：v2rayA 生成的所有入站都硬编码 "listen": "127.0.0.1"，
+  #  局域网设备连不上。用 socat 把 LAN 地址上的端口转发到 127.0.0.1 的入站。
+  #
+  #  ★ 端口语义（v2rayA 的路由规则带 inboundTag 限定，选错端口就白搭）：
+  #    20170 socks_ipv4      → 全量代理，不分流
+  #    20171 http_ipv4       → 全量代理，不分流
+  #    20172 rule-http_ipv4  → 按分流规则（国内直连 / 海外走节点）
+  #    20173 rule-socks_ipv4 → 按分流规则（需在面板把“SOCKS5(PAC) 端口”设为 20173）
+  #    52345 transparent     → NAS 本机流量，自动分流
+  #  所以对外只暴露 20172 / 20173，客户端不需要知道“哪个端口才分流”。
+  #
+  #  ★ bind 地址在启动时自动探测 eth0，不写死 IP，换网段/DHCP 重分配都不用改。
+  #  ★ compose 会把 $VAR 当变量插值，shell 变量必须写成 $$VAR（awk 的 $2 → $$2）。
+  #  ⚠️ 这三个端口无鉴权：局域网内任何设备都能借此出墙；不用就 docker stop v2raya-lan。
+  # ----------------------------------------------------------------------------
+  v2raya-lan:
+    image: alpine/socat:latest
+    container_name: v2raya-lan
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: Asia/Shanghai
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        IP=$$(/sbin/ip -4 addr show eth0 2>/dev/null | awk '/inet /{print $$2}' | cut -d/ -f1 | head -1)
+        if [ -z "$$IP" ]; then IP=$$(hostname -i 2>/dev/null | tr ' ' '\n' | grep -E '^192\.168\.' | head -1); fi
+        if [ -z "$$IP" ]; then IP=0.0.0.0; fi
+        echo "[bridge] 绑定地址: $$IP (自动探测)"
+        echo "[bridge] SOCKS5 $$IP:1080 -> 127.0.0.1:20173  (自动分流)"
+        echo "[bridge] HTTP   $$IP:8118 -> 127.0.0.1:20172  (自动分流)"
+        echo "[bridge] HTTP   $$IP:8119 -> 127.0.0.1:20171  (全量, 特殊场景备用)"
+        socat -d TCP-LISTEN:1080,fork,reuseaddr,bind=$$IP TCP:127.0.0.1:20173 &
+        socat -d TCP-LISTEN:8118,fork,reuseaddr,bind=$$IP TCP:127.0.0.1:20172 &
+        socat -d TCP-LISTEN:8119,fork,reuseaddr,bind=$$IP TCP:127.0.0.1:20171 &
+        wait
+
+  # ----------------------------------------------------------------------------
+  #  mark 保护自愈（★ 透明代理能不能用全靠它）
+  #
+  #  根因：QTS 固件在 mangle OUTPUT 里有一条无条件规则
+  #      -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff
+  #  它把每个本地出站包的 packet mark 用 conntrack mark(=0) 全掩码覆盖，
+  #  导致 xray 的 SO_MARK(0x80) 出站即被抹掉 → v2rayA 的
+  #  “--mark 0x80 RETURN” 旁路永远匹配不上 → xray 出站连接被透明代理自己
+  #  再拦一次 → 无限自连（一次请求 80+ 次自连），全网瘫痪。
+  #
+  #  修复：在 mangle OUTPUT 最前面插一条
+  #      -p tcp -m mark --mark 0x80/0x80 -j RETURN
+  #  已带 0x80 的包直接跳过本链（也就跳过了 restore），mark 得以存活。
+  #
+  #  用循环而不是只插一次：QTS 升级/重启/防火墙重载都可能清掉 mangle 规则，
+  #  30 秒自愈一次最稳（-C 判重，幂等）。
+  # ----------------------------------------------------------------------------
+  v2raya-markfix:
+    image: mzz2017/v2raya:v2.5.10   # 复用本地镜像，借它的 iptables 包装器
+    container_name: v2raya-markfix
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    environment:
+      TZ: Asia/Shanghai
+      IPTABLES_MODE: legacy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[markfix] 守护 mangle OUTPUT 的 mark 0x80 旁路"
+        while true; do
+          IPTABLES_MODE=legacy iptables -t mangle -C OUTPUT -p tcp -m mark --mark 0x80/0x80 -j RETURN 2>/dev/null || \
+            { IPTABLES_MODE=legacy iptables -t mangle -I OUTPUT 1 -p tcp -m mark --mark 0x80/0x80 -j RETURN && echo "[markfix] 已补插 $(date '+%F %T')"; }
+          sleep 30
+        done
