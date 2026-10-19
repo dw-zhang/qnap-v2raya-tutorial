@@ -4,8 +4,9 @@
 #  适配：QTS 5.x / Container Station（docker 27.x / compose v2.29）
 #  镜像：mzz2017/v2raya:v2.5.10（内置 v2raya_core 2.5.10，基于 xray-core）
 #
-#  部署：
-#    mkdir -p /share/Container/v2raya/{config,logs}
+#  部署（完整步骤见 README，这里只列顺序）：
+#    sh scripts/pull-images.sh                       # 第 2 步：国内先拉镜像
+#    mkdir -p /share/Container/v2raya/{config,logs}  # 第 3 步
 #    cd /share/Container/v2raya && docker compose up -d
 #    面板：http://<NAS-IP>:2017  （首次打开创建管理员账号）
 #
@@ -104,19 +105,12 @@ services:
   # ----------------------------------------------------------------------------
   #  mark 保护自愈（★ 透明代理能不能用全靠它）
   #
-  #  根因：QTS 固件在 mangle OUTPUT 里有一条无条件规则
-  #      -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff
-  #  它把每个本地出站包的 packet mark 用 conntrack mark(=0) 全掩码覆盖，
-  #  导致 xray 的 SO_MARK(0x80) 出站即被抹掉 → v2rayA 的
-  #  “--mark 0x80 RETURN” 旁路永远匹配不上 → xray 出站连接被透明代理自己
-  #  再拦一次 → 无限自连（一次请求 80+ 次自连），全网瘫痪。
+  #  QTS 在 mangle OUTPUT 里有一条无条件 CONNMARK --restore-mark，会把 xray
+  #  出站包的 SO_MARK(0x80) 抹掉 → 旁路失效 → 无限自连 → 整机断网。
+  #  这里每 30 秒补插一条 "--mark 0x80/0x80 -j RETURN"（-C 判重，幂等），
+  #  因为 QTS 升级/重启/防火墙重载都会把规则清掉。
   #
-  #  修复：在 mangle OUTPUT 最前面插一条
-  #      -p tcp -m mark --mark 0x80/0x80 -j RETURN
-  #  已带 0x80 的包直接跳过本链（也就跳过了 restore），mark 得以存活。
-  #
-  #  用循环而不是只插一次：QTS 升级/重启/防火墙重载都可能清掉 mangle 规则，
-  #  30 秒自愈一次最稳（-C 判重，幂等）。
+  #  完整原理见 README 附录 C.1。
   # ----------------------------------------------------------------------------
   v2raya-markfix:
     image: mzz2017/v2raya:v2.5.10   # 复用本地镜像，借它的 iptables 包装器

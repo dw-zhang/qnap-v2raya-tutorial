@@ -41,6 +41,17 @@
 
 还需要一台电脑来操作（Mac / Windows 都行），和 NAS 在同一个局域网。
 
+**实测环境**（版本不必完全一致，大版本接近即可）：
+
+| 项目 | 版本 |
+|---|---|
+| NAS | QNAP，QTS **5.2.9**，内核 `5.10.60-qnap`，x86_64 |
+| Container Station | Docker **27.1.2-qnap8** / Compose **v2.29.1-qnap2** |
+| v2rayA | `mzz2017/v2raya:v2.5.10`（内置 core 基于 xray-core） |
+| 面板 | v2rayA 自带 Web UI，端口 `2017` |
+
+ARM 机型（`aarch64`）也能跑，镜像支持多架构，步骤完全一样。
+
 ---
 
 ## 最终效果
@@ -710,6 +721,20 @@ HTTP  192.168.1.10:8119    36.231.107.250    36.231.107.250    200      全量�
 > 这套判定不依赖本机有没有挂代理：它拿全量端口（8119）的国内出口当基准，
 > 谁和它一样就说明谁被绕出去了。所以在 NAS 本机跑同样准。
 
+### 再补两条手工检查
+
+```bash
+# 1) markfix 是否在位：第一行应该是 RETURN ... mark match 0x80/0x80
+sudo iptables -t mangle -L OUTPUT -n -v | head -3
+
+# 2) 入站端口是否齐全
+netstat -tln | grep -E ':(2017[0-9]|52345|1080|8118) '
+```
+
+预期能看到 `2017`、`20170`~`20173`、`52345`，以及 `1080` / `8118` / `8119`。
+
+第一条如果第一行不是 `RETURN`，等 30 秒让 markfix 补插；还是没有就 `$D logs v2raya-markfix`。
+
 ---
 
 # 第 9 步：让局域网设备用上
@@ -965,6 +990,64 @@ sudo cp -a config-backup-20261017-190951/v2raya.db config/
 $D compose up -d
 ```
 
+### 高级：没有 sqlite3 怎么直接改配置库
+
+QNAP 默认没有 `sqlite3` 命令（`command -v sqlite3` 为空）。**能面板改的就从面板改**，
+只有批量改端口、救砖这类场景才动库：
+
+```bash
+# 1) 停容器：SQLite 会自动 checkpoint，并清掉 -wal/-shm
+$D stop v2raya
+
+# 2) 把库拉到本地（在你自己的电脑上执行）
+scp admin@192.168.1.10:/share/Container/v2raya/config/v2raya.db ./
+
+# 3) 本地用 Python 的 sqlite3 改（Python 3 自带，不用装）
+python3 - <<'PY'
+import sqlite3
+con = sqlite3.connect("v2raya.db")
+row = con.execute("SELECT value FROM system_config WHERE key='system:ports'").fetchone()
+print("当前 system:ports =", row[0] if row else "MISSING")
+# 要改就改，改完 commit；不改也可以只用来查看
+con.execute("PRAGMA journal_mode=DELETE")
+con.commit(); con.close()
+PY
+
+# 4) 传回去，属主改回 1000（否则容器写不进去）
+scp ./v2raya.db admin@192.168.1.10:/tmp/v2raya.db
+ssh admin@192.168.1.10 'sudo cp /tmp/v2raya.db /share/Container/v2raya/config/v2raya.db \
+  && sudo chown 1000:1000 /share/Container/v2raya/config/v2raya.db \
+  && sudo rm -f /share/Container/v2raya/config/v2raya.db-wal /share/Container/v2raya/config/v2raya.db-shm'
+
+# 5) 起容器
+$D start v2raya
+```
+
+> 库里字符串值是 **JSON 编码**的（带引号），比如 `"20173"` 而不是 `20173`。改的时候别把引号弄丢。
+
+---
+
+# 安全须知
+
+公开这份教程 / 发布仓库时，这几点必须注意：
+
+1. **绝对不要提交**：订阅链接、节点 UUID、节点域名、面板密码、SSH 密码、`v2raya.db`。
+   `v2raya.db` 里有 JWT 密钥和账号 hash，`config.json` 里有节点凭据。
+2. `.gitignore` 已经排除了这些，**不要**用 `git add -f` 强行加进来。
+3. 局域网代理端口（`1080` / `8118` / `8119`）**没有鉴权**，任何能连到 NAS 的设备都能借此出墙。
+   不想开放就 `$D stop v2raya-lan`。
+4. **不要把 8118 映射到公网**。要远程用就走 Tailscale / WireGuard / 第 11 步之外的方案。
+5. FastGithub 的 `cacert` 里那对私钥**只属于你这台机器**，别外传。
+
+发布前自检一遍：
+
+```bash
+git status --short          # 有没有意外加进来的 db / 证书 / 配置
+git ls-files | grep -Ei 'v2raya\.db|config\.json|cacert|\.pem|\.key'
+```
+
+第二条**应该没有任何输出**。有输出就 `git rm --cached <文件>` 并补进 `.gitignore`。
+
 ---
 
 # 附录 A：端口总表
@@ -1084,12 +1167,38 @@ curl -o /dev/null -w '%{http_code}' http://<NAS_IP>:2017/proxy.pac   # 404
 `$$IP`（转义成 `$IP`），awk 的 `$2` 要写 `$$2`。否则 `bind=` 会变成空字符串，
 三个端口全部起不来，报错还很不直观：`getaddrinfo(""): Name does not resolve`。
 
-## C.8 QNAP 上的两条硬性约束
+## C.8 compose 里每一项为什么这么写
 
-| 配置 | 原因 |
+| 配置 | 作用 / 为什么必须这么写 |
 |---|---|
+| `network_mode: host` | 透明代理要直接改主机网络栈；容器 netns 里的 iptables 对宿主机无效 |
+| `privileged: true` | 写 iptables、读 `/dev/net/tun` 需要特权 |
 | `--nftables-support=off` | QNAP 内核**没有 `nf_tables` 子系统**，走 nft 路径必失败 |
 | `IPTABLES_MODE: legacy` | 镜像里的 `iptables` 是包装脚本，默认走 `xtables-nft-multi`，QNAP 上只有 legacy 能用 |
+| `dns: 223.5.5.5, 119.29.29.29` | 宿主机装了 Tailscale 时 `/etc/resolv.conf` 会指向 MagicDNS `100.100.100.100`，解析订阅/节点域名经常超时 |
+| `volumes: config:/etc/v2raya` | 账号、节点、规则全在这里，不挂载容器一重建就清零 |
+| `volumes: /lib/modules:ro` | 透明代理需要读内核模块信息 |
+| `healthcheck` | 面板起没起来，`$D ps` 能直接看到 `(healthy)` |
+| `v2raya-lan`（socat） | v2rayA 生成的入站全部只绑 `127.0.0.1`，局域网连不上，必须转发 |
+| `v2raya-markfix` | 见 [C.1](#c1-为什么需要-markfix) |
+
+## C.9 内置分流规则到底长什么样
+
+v2rayA 生成的默认规则，**按顺序匹配、命中即停**：
+
+| 顺序 | 匹配 | 去向 |
+|:--:|---|---|
+| 1 | 节点自己的域名（`txt00x.xxx:443`） | 直连（否则会自己代理自己） |
+| 2 | `push.apple.com` 等苹果推送 | 直连 |
+| 3 | `geolocation-!cn`（海外域名库） | 代理 |
+| 4 | `geosite:google` | 代理 |
+| 5 | `geosite:cn`（国内域名库） | 直连 |
+| 6 | `geoip:hk` / `geoip:mo` | 代理 |
+| 7 | `geoip:private` / `geoip:cn` / 内网段 | 直连 |
+| 8 | 兜底 | 代理 |
+
+这就是「国内走白名单直连、海外走规则代理」的实现。规则不需要你手写，
+但要知道第 1 条的存在——改节点配置时如果域名写错，会掉进第 1 条导致全网直连。
 
 ---
 
