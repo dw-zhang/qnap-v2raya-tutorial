@@ -228,7 +228,7 @@ sh /tmp/pull-images.sh
 
 ```bash
 cd /share/Container
-git clone https://github.com/你的用户名/qnap-v2raya-tutorial.git
+git clone https://github.com/dw-zhang/qnap-v2raya-tutorial.git
 cd qnap-v2raya-tutorial
 sh scripts/pull-images.sh
 ```
